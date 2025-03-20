@@ -4,6 +4,7 @@ import com.thinknows.x_server.model.User;
 import com.thinknows.x_server.model.request.LoginRequest;
 import com.thinknows.x_server.model.request.RefreshTokenRequest;
 import com.thinknows.x_server.model.request.RegisterRequest;
+import com.thinknows.x_server.model.request.TwoFactorVerifyRequest;
 import com.thinknows.x_server.model.response.ApiResponse;
 import com.thinknows.x_server.model.response.LoginResponse;
 import com.thinknows.x_server.model.response.TokenResponse;
@@ -67,31 +68,42 @@ public class AuthController {
 
         try {
             // Login user
-            User user = userService.login(request);
-            if (user == null) {
+            LoginResponse loginResponse = userService.login(request);
+            if (loginResponse == null) {
                 return ResponseEntity.badRequest().body(ApiResponse.error(400, "Invalid username or password"));
             }
-
-            // Generate tokens
-            TokenResponse tokens = userService.generateTokens(user);
             
-            // Create a clean user object for response
-            User userResponse = new User();
-            userResponse.setId(user.getId());
-            userResponse.setUsername(user.getUsername());
-            userResponse.setEmail(user.getEmail());
-            userResponse.setPhone(user.getPhone());
-            userResponse.setCreatedAt(user.getCreatedAt());
-            userResponse.setUpdatedAt(user.getUpdatedAt());
-            userResponse.setActive(user.isActive());
-            
-            LoginResponse loginResponse = new LoginResponse(tokens, userResponse);
+            // 检查是否需要二次验证
+            if (loginResponse.isRequiresTwoFactor()) {
+                return ResponseEntity.ok(ApiResponse.success("Two-factor authentication required", loginResponse));
+            }
             
             return ResponseEntity.ok(ApiResponse.success("Login successful", loginResponse));
+        } catch (UserService.AccountLockedException e) {
+            return ResponseEntity.status(403).body(ApiResponse.error(403, e.getMessage()));
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.status(500).body(ApiResponse.error(500, "Internal server error: " + e.getMessage()));
         }
+    }
+    
+    @PostMapping("/verify-2fa")
+    public ResponseEntity<ApiResponse<LoginResponse>> verifyTwoFactor(@RequestBody TwoFactorVerifyRequest request) {
+        // Validate request
+        if (request.getTwoFactorToken() == null || request.getTwoFactorToken().isEmpty()) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(400, "Two-factor token is required"));
+        }
+        if (request.getCode() == null || request.getCode().isEmpty()) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(400, "Verification code is required"));
+        }
+        
+        // Verify code
+        LoginResponse response = userService.verifyTwoFactorCode(request);
+        if (response == null) {
+            return ResponseEntity.badRequest().body(ApiResponse.error(400, "Invalid token or code"));
+        }
+        
+        return ResponseEntity.ok(ApiResponse.success("Two-factor authentication successful", response));
     }
     
     @PostMapping("/refresh")

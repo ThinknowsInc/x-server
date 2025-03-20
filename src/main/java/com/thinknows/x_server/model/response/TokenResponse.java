@@ -21,6 +21,14 @@ public class TokenResponse {
         this.accessTokenExpiry = accessTokenExpiry;
         this.refreshTokenExpiry = refreshTokenExpiry;
     }
+    
+    public TokenResponse(String accessToken, String refreshToken, int accessTokenValidityMinutes, int refreshTokenValidityMinutes) {
+        this();
+        this.accessToken = accessToken;
+        this.refreshToken = refreshToken;
+        this.accessTokenExpiry = LocalDateTime.now().plusMinutes(accessTokenValidityMinutes);
+        this.refreshTokenExpiry = LocalDateTime.now().plusMinutes(refreshTokenValidityMinutes);
+    }
 
     public String getAccessToken() {
         return accessToken;

@@ -1,91 +1,350 @@
 package com.thinknows.x_server.service;
 
+import com.thinknows.x_server.model.DeviceInfo;
 import com.thinknows.x_server.model.User;
 import com.thinknows.x_server.model.request.LoginRequest;
 import com.thinknows.x_server.model.request.RefreshTokenRequest;
 import com.thinknows.x_server.model.request.RegisterRequest;
+import com.thinknows.x_server.model.request.TwoFactorVerifyRequest;
+import com.thinknows.x_server.model.response.DeviceSession;
+import com.thinknows.x_server.model.response.LoginResponse;
 import com.thinknows.x_server.model.response.TokenResponse;
 import com.thinknows.x_server.model.response.UserProfileResponse;
+import com.thinknows.x_server.repository.UserRepository;
+
+import org.mindrot.jbcrypt.BCrypt;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import java.security.Key;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Service
 public class UserService {
-    private final Map<String, User> userMap = new HashMap<>();
+    
+    /**
+     * 账户锁定异常
+     */
+    public static class AccountLockedException extends RuntimeException {
+        public AccountLockedException(String message) {
+            super(message);
+        }
+    }
+    @Autowired
+    private UserRepository userRepository;
     private final Map<String, String> refreshTokenStore = new HashMap<>(); // username -> refreshToken
     private final Map<String, String> accessTokenStore = new HashMap<>(); // username -> accessToken
     private final Map<String, LocalDateTime> accessTokenExpiryStore = new HashMap<>(); // accessToken -> expiry
     private final Map<String, LocalDateTime> refreshTokenExpiryStore = new HashMap<>(); // refreshToken -> expiry
     
+    // 存储用户的活跃会话
+    private final Map<String, Set<String>> userActiveSessions = new HashMap<>(); // username -> Set<sessionId>
+    private final Map<String, String> sessionToUsername = new HashMap<>(); // sessionId -> username
+    private final Map<String, DeviceSession> sessionInfo = new HashMap<>(); // sessionId -> DeviceSession
+    
+    // 存储登录失败尝试
+    private final Map<String, Integer> failedLoginAttempts = new HashMap<>(); // username -> attempts count
+    private final Map<String, LocalDateTime> lockoutTime = new HashMap<>(); // username -> lockout until
+    
+    // 存储二次验证码
+    private final Map<String, String> twoFactorCodes = new HashMap<>(); // username -> code
+    private final Map<String, LocalDateTime> twoFactorCodeExpiry = new HashMap<>(); // username -> expiry
+    private final Map<String, String> twoFactorTokens = new HashMap<>(); // token -> username
+    
     // Token validity periods (in minutes)
     private static final int ACCESS_TOKEN_VALIDITY_MINUTES = 30; // 30 minutes
     private static final int REFRESH_TOKEN_VALIDITY_MINUTES = 43200; // 30 days
+    private static final int EXTENDED_REFRESH_TOKEN_VALIDITY_DAYS = 30; // 30 days for "remember me"
     
-    private final AtomicLong idCounter = new AtomicLong(1);
+    // 登录尝试限制
+    private static final int MAX_FAILED_ATTEMPTS = 5;
+    private static final int LOCKOUT_DURATION_MINUTES = 15;
+    
+    // 二次验证码有效期
+    private static final int TWO_FACTOR_CODE_VALIDITY_MINUTES = 10;
+    
+    // JWT 密钥
+    private static final Key JWT_SECRET_KEY = Keys.secretKeyFor(SignatureAlgorithm.HS512);
+    
+    // 不再需要手动管理ID，由数据库自动生成
 
     public User register(RegisterRequest request) {
         // Check if username already exists
-        if (userMap.containsKey(request.getUsername())) {
+        if (userRepository.existsByUsername(request.getUsername())) {
             return null; // Username already exists
         }
+        
+        // Check if email already exists
+        if (userRepository.existsByEmail(request.getEmail())) {
+            return null; // Email already exists
+        }
 
-        // Create new user
+        // Hash the password using BCrypt
+        String hashedPassword = BCrypt.hashpw(request.getPassword(), BCrypt.gensalt());
+        
+        // Create new user with hashed password
         User user = new User(
                 request.getUsername(),
-                request.getPassword(), // In a real app, you should hash the password
+                hashedPassword,
                 request.getEmail(),
                 request.getPhone()
         );
-        user.setId(idCounter.getAndIncrement());
 
-        // Save user to map
-        userMap.put(user.getUsername(), user);
-        return user;
+        // Save user to database
+        return userRepository.save(user);
     }
 
-    public User login(LoginRequest request) {
-        // Check if user exists
-        User user = userMap.get(request.getUsername());
+    
+    /**
+     * 登录方法，支持密码验证、登录尝试限制和二次验证
+     */
+    public LoginResponse login(LoginRequest request) {
+        String username = request.getUsername();
+        
+        // 检查是否被锁定
+        if (isUserLockedOut(username)) {
+            throw new AccountLockedException("账户已被锁定，请稍后再试");
+        }
+        
+        // 检查用户是否存在
+        User user = userRepository.findByUsername(username).orElse(null);
         if (user == null) {
-            return null; // User not found
+            recordFailedLoginAttempt(username);
+            return null; // 用户不存在
         }
-
-        // Check if password matches
+        
+        // 检查密码是否匹配（使用 BCrypt 验证）
         String storedPassword = user.getPassword();
-        if (storedPassword == null || !storedPassword.equals(request.getPassword())) {
-            return null; // Password doesn't match or is null
+        if (storedPassword == null || !BCrypt.checkpw(request.getPassword(), storedPassword)) {
+            recordFailedLoginAttempt(username);
+            return null; // 密码不匹配
         }
-
-        return user;
+        
+        // 登录成功，重置失败计数
+        resetFailedLoginAttempts(username);
+        
+        // 检查用户是否启用了二次验证
+        if (user.isTwoFactorEnabled()) {
+            // 生成二次验证码
+            String twoFactorCode = generateTwoFactorCode();
+            String twoFactorToken = generateTwoFactorToken(username);
+            
+            // 存储验证码
+            twoFactorCodes.put(username, twoFactorCode);
+            twoFactorCodeExpiry.put(username, LocalDateTime.now().plusMinutes(TWO_FACTOR_CODE_VALIDITY_MINUTES));
+            twoFactorTokens.put(twoFactorToken, username);
+            
+            // 发送验证码到用户邮箱或手机（模拟）
+            sendTwoFactorCode(user, twoFactorCode);
+            
+            // 返回需要二次验证的响应
+            LoginResponse response = new LoginResponse();
+            response.setUser(cleanUserForResponse(user));
+            response.setRequiresTwoFactor(true);
+            response.setTwoFactorToken(twoFactorToken);
+            return response;
+        }
+        
+        // 不需要二次验证，直接生成令牌
+        TokenResponse tokens = generateTokens(user, request.getDeviceInfo(), request.isRememberMe());
+        
+        // 获取用户的活跃会话
+        List<DeviceSession> activeSessions = getUserActiveSessions(username);
+        
+        return new LoginResponse(tokens, cleanUserForResponse(user), false, null, activeSessions);
+    }
+    
+    /**
+     * 清理敏感信息，返回安全的用户对象
+     */
+    private User cleanUserForResponse(User user) {
+        User cleanUser = new User();
+        cleanUser.setId(user.getId());
+        cleanUser.setUsername(user.getUsername());
+        cleanUser.setEmail(user.getEmail());
+        cleanUser.setPhone(user.getPhone());
+        cleanUser.setCreatedAt(user.getCreatedAt());
+        cleanUser.setUpdatedAt(user.getUpdatedAt());
+        cleanUser.setActive(user.isActive());
+        cleanUser.setTwoFactorEnabled(user.isTwoFactorEnabled());
+        return cleanUser;
+    }
+    
+    /**
+     * 记录登录失败尝试
+     */
+    private void recordFailedLoginAttempt(String username) {
+        int attempts = failedLoginAttempts.getOrDefault(username, 0) + 1;
+        failedLoginAttempts.put(username, attempts);
+        
+        // 如果达到最大尝试次数，锁定账户
+        if (attempts >= MAX_FAILED_ATTEMPTS) {
+            lockoutTime.put(username, LocalDateTime.now().plusMinutes(LOCKOUT_DURATION_MINUTES));
+        }
+    }
+    
+    /**
+     * 检查用户是否被锁定
+     */
+    private boolean isUserLockedOut(String username) {
+        LocalDateTime lockedUntil = lockoutTime.get(username);
+        return lockedUntil != null && lockedUntil.isAfter(LocalDateTime.now());
+    }
+    
+    /**
+     * 重置登录失败计数
+     */
+    private void resetFailedLoginAttempts(String username) {
+        failedLoginAttempts.remove(username);
+        lockoutTime.remove(username);
+    }
+    
+    /**
+     * 生成二次验证码
+     */
+    private String generateTwoFactorCode() {
+        // 生成 6 位数字验证码
+        Random random = new Random();
+        int code = 100000 + random.nextInt(900000);
+        return String.valueOf(code);
+    }
+    
+    /**
+     * 生成二次验证令牌
+     */
+    private String generateTwoFactorToken(String username) {
+        return UUID.randomUUID().toString();
+    }
+    
+    /**
+     * 验证二次验证码
+     */
+    public LoginResponse verifyTwoFactorCode(TwoFactorVerifyRequest request) {
+        // 验证令牌
+        String token = request.getTwoFactorToken();
+        if (token == null || !twoFactorTokens.containsKey(token)) {
+            return null; // 无效的令牌
+        }
+        
+        // 获取用户名
+        String username = twoFactorTokens.get(token);
+        User user = userRepository.findByUsername(username).orElse(null);
+        if (user == null) {
+            return null; // 用户不存在
+        }
+        
+        // 检查验证码
+        String storedCode = twoFactorCodes.get(username);
+        LocalDateTime expiry = twoFactorCodeExpiry.get(username);
+        
+        if (storedCode == null || expiry == null || expiry.isBefore(LocalDateTime.now())) {
+            return null; // 验证码不存在或已过期
+        }
+        
+        if (!storedCode.equals(request.getCode())) {
+            return null; // 验证码不匹配
+        }
+        
+        // 验证成功，清除验证码
+        twoFactorCodes.remove(username);
+        twoFactorCodeExpiry.remove(username);
+        twoFactorTokens.remove(token);
+        
+        // 生成令牌
+        TokenResponse tokens = generateTokens(user, request.getDeviceInfo(), false);
+        
+        // 获取用户的活跃会话
+        List<DeviceSession> activeSessions = getUserActiveSessions(username);
+        
+        return new LoginResponse(tokens, cleanUserForResponse(user), false, null, activeSessions);
+    }
+    
+    /**
+     * 模拟发送二次验证码
+     */
+    private void sendTwoFactorCode(User user, String code) {
+        // 在实际应用中，这里应该发送邮件或短信
+        System.out.println("Sending 2FA code to " + user.getEmail() + ": " + code);
     }
 
+    /**
+     * 获取用户的活跃会话
+     */
+    public List<DeviceSession> getUserActiveSessions(String username) {
+        Set<String> sessionIds = userActiveSessions.getOrDefault(username, new HashSet<>());
+        return sessionIds.stream()
+                .map(sessionInfo::get)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 生成访问令牌和刷新令牌
+     */
     public TokenResponse generateTokens(User user) {
+        return generateTokens(user, null, false);
+    }
+    
+    /**
+     * 生成访问令牌和刷新令牌，支持设备信息和记住我功能
+     */
+    public TokenResponse generateTokens(User user, DeviceInfo deviceInfo, boolean rememberMe) {
         String username = user.getUsername();
         
-        // Generate new tokens
-        String accessToken = generateSecureToken();
-        String refreshToken = generateSecureToken();
-        
-        // Set expiry times
+        // 生成 JWT 令牌
+        String accessToken = generateJwtToken(user, ACCESS_TOKEN_VALIDITY_MINUTES);
+        String refreshToken = generateJwtToken(user, rememberMe ? 
+                EXTENDED_REFRESH_TOKEN_VALIDITY_DAYS * 24 * 60 : REFRESH_TOKEN_VALIDITY_MINUTES);
+
+        // 设置过期时间
         LocalDateTime accessTokenExpiry = LocalDateTime.now().plusMinutes(ACCESS_TOKEN_VALIDITY_MINUTES);
-        LocalDateTime refreshTokenExpiry = LocalDateTime.now().plusMinutes(REFRESH_TOKEN_VALIDITY_MINUTES);
+        LocalDateTime refreshTokenExpiry = rememberMe ?
+                LocalDateTime.now().plusDays(EXTENDED_REFRESH_TOKEN_VALIDITY_DAYS) :
+                LocalDateTime.now().plusMinutes(REFRESH_TOKEN_VALIDITY_MINUTES);
         
-        // Store tokens
+        // 存储令牌
         accessTokenStore.put(username, accessToken);
         refreshTokenStore.put(username, refreshToken);
         accessTokenExpiryStore.put(accessToken, accessTokenExpiry);
         refreshTokenExpiryStore.put(refreshToken, refreshTokenExpiry);
         
-        return new TokenResponse(accessToken, refreshToken, accessTokenExpiry, refreshTokenExpiry);
+        // 创建新会话
+        if (deviceInfo != null) {
+            String sessionId = UUID.randomUUID().toString();
+            DeviceSession session = new DeviceSession();
+            session.setSessionId(sessionId);
+            session.setDeviceInfo(deviceInfo);
+            session.setLoginTime(LocalDateTime.now());
+            session.setLastActivityTime(LocalDateTime.now());
+            session.setIpAddress("127.0.0.1"); // 在实际应用中，从请求中获取
+            session.setCurrentDevice(true);
+            
+            // 存储会话信息
+            Set<String> userSessions = userActiveSessions.computeIfAbsent(username, k -> new HashSet<>());
+            userSessions.add(sessionId);
+            sessionToUsername.put(sessionId, username);
+            sessionInfo.put(sessionId, session);
+        }
+
+        // 返回令牌响应
+        return new TokenResponse(accessToken, refreshToken, ACCESS_TOKEN_VALIDITY_MINUTES, 
+                rememberMe ? EXTENDED_REFRESH_TOKEN_VALIDITY_DAYS * 24 * 60 : REFRESH_TOKEN_VALIDITY_MINUTES);
     }
     
     public TokenResponse refreshToken(RefreshTokenRequest request) {
@@ -114,7 +373,7 @@ public class UserService {
         }
         
         // Get user
-        User user = userMap.get(username);
+        User user = userRepository.findByUsername(username).orElse(null);
         if (user == null) {
             return null; // User not found
         }
@@ -155,7 +414,7 @@ public class UserService {
             return null; // Username not found
         }
         
-        return userMap.get(username);
+        return userRepository.findByUsername(username).orElse(null);
     }
     
     private String getUsernameByAccessToken(String accessToken) {
@@ -174,6 +433,23 @@ public class UserService {
             }
         }
         return null;
+    }
+    
+    /**
+     * 生成 JWT 令牌
+     */
+    private String generateJwtToken(User user, int validityMinutes) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + validityMinutes * 60 * 1000);
+        
+        return Jwts.builder()
+                .setSubject(user.getUsername())
+                .setIssuedAt(now)
+                .setExpiration(expiryDate)
+                .claim("userId", user.getId())
+                .claim("email", user.getEmail())
+                .signWith(JWT_SECRET_KEY)
+                .compact();
     }
     
     private String generateSecureToken() {

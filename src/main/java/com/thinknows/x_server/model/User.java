@@ -1,16 +1,43 @@
 package com.thinknows.x_server.model;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
 
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
+
+@Entity
+@Table(name = "users")
 public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+    @Column(unique = true, nullable = false, length = 50)
     private String username;
+    @Column(nullable = false)
     private String password;
+    @Column(unique = true)
     private String email;
+    @Column
     private String phone;
+    @Column(name = "created_at")
     private LocalDateTime createdAt;
+    @Column(name = "updated_at")
     private LocalDateTime updatedAt;
+    @Column
     private boolean active;
+    @Column(name = "two_factor_enabled")
+    private boolean twoFactorEnabled = false;
+    @Column(name = "two_factor_secret")
+    private String twoFactorSecret;
+    @Transient // 暂时使用Transient注解，实际应用中应该创建关联表
+    private Map<String, String> socialIds = new HashMap<>(); // 社交媒体ID映射
 
     public User() {
         this.createdAt = LocalDateTime.now();
@@ -88,5 +115,37 @@ public class User {
 
     public void setActive(boolean active) {
         this.active = active;
+    }
+    
+    public boolean isTwoFactorEnabled() {
+        return twoFactorEnabled;
+    }
+    
+    public void setTwoFactorEnabled(boolean twoFactorEnabled) {
+        this.twoFactorEnabled = twoFactorEnabled;
+    }
+    
+    public String getTwoFactorSecret() {
+        return twoFactorSecret;
+    }
+    
+    public void setTwoFactorSecret(String twoFactorSecret) {
+        this.twoFactorSecret = twoFactorSecret;
+    }
+    
+    public Map<String, String> getSocialIds() {
+        return socialIds;
+    }
+    
+    public void setSocialIds(Map<String, String> socialIds) {
+        this.socialIds = socialIds;
+    }
+    
+    public void addSocialId(String provider, String id) {
+        this.socialIds.put(provider, id);
+    }
+    
+    public String getSocialId(String provider) {
+        return this.socialIds.get(provider);
     }
 }
