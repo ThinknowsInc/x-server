@@ -1,17 +1,19 @@
 package com.thinknows.x_server.model;
 
+import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
 import java.util.HashMap;
 
 public class AppConfig {
     private String appVersion;
     private String apiBaseUrl;
     private boolean debugMode;
-    private Map<String, String> endpoints;
+    private List<Endpoint> endpoints;
     private Map<String, Object> features;
 
     public AppConfig() {
-        this.endpoints = new HashMap<>();
+        this.endpoints = new ArrayList<>();
         this.features = new HashMap<>();
     }
 
@@ -39,11 +41,11 @@ public class AppConfig {
         this.debugMode = debugMode;
     }
 
-    public Map<String, String> getEndpoints() {
+    public List<Endpoint> getEndpoints() {
         return endpoints;
     }
 
-    public void setEndpoints(Map<String, String> endpoints) {
+    public void setEndpoints(List<Endpoint> endpoints) {
         this.endpoints = endpoints;
     }
 
